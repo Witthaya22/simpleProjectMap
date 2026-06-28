@@ -97,9 +97,10 @@ class MainActivity : ComponentActivity() {
             getSharedPreferences("osmdroid", MODE_PRIVATE))
         Configuration.getInstance().apply {
             userAgentValue = packageName
-            // ใช้ filesDir (ถาวร) แทน cacheDir (Android ลบได้เมื่อหน่วยความจำไม่พอ)
             osmdroidBasePath = filesDir
             osmdroidTileCache = File(filesDir, "osmdroid_tiles")
+            tileDownloadThreads = 4              // โหลด tiles พร้อมกัน 4 thread = เร็วขึ้น
+            tileDownloadMaxQueueSize = 40        // queue เยอะขึ้น
         }
 
         setContentView(R.layout.activity_main)
@@ -133,7 +134,9 @@ class MainActivity : ComponentActivity() {
     private fun setupMap() {
         mapView.setTileSource(TileSourceFactory.MAPNIK)
         mapView.setMultiTouchControls(true)
-        mapView.controller.setZoom(18.0)
+        mapView.isTilesScaledToDpi = false      // tiles คม ไม่ blur บน high-DPI
+        mapView.setUseDataConnection(true)       // โหลด tiles จากอินเทอร์เน็ตได้เสมอ
+        mapView.controller.setZoom(17.0)         // zoom 17 = มองเห็นพื้นที่ดีกว่า ก่อนซูมเข้าเอง
         mapView.controller.setCenter(KMUTNB_GATE)
 
         // MapEventsOverlay รับ tap บนแผนที่ — ต้องอยู่ท้ายสุดเสมอ
@@ -423,13 +426,25 @@ class MainActivity : ComponentActivity() {
 
     // ───────────────────────── Offline Tile Download ─────────────────────────
 
-    // ขอบเขตบริเวณ มจพ. ปราจีนบุรี + โดยรอบเล็กน้อย
-    private val CAMPUS_SOUTH = 14.152
-    private val CAMPUS_NORTH = 14.175
-    private val CAMPUS_WEST  = 101.335
-    private val CAMPUS_EAST  = 101.362
     private val ZOOM_MIN = 14
     private val ZOOM_MAX = 19
+
+    // คำนวณพื้นที่ download: ถ้ามี waypoints ใช้ bbox ของ waypoints, ไม่งั้นใช้ viewport ปัจจุบัน
+    private fun downloadBounds(): DoubleArray {
+        return if (customWaypoints.size >= 2) {
+            val buf = 0.005 // ~500m buffer รอบ waypoints
+            doubleArrayOf(
+                customWaypoints.minOf { it.latitude } - buf,
+                customWaypoints.maxOf { it.latitude } + buf,
+                customWaypoints.minOf { it.longitude } - buf,
+                customWaypoints.maxOf { it.longitude } + buf
+            )
+        } else {
+            val box = mapView.boundingBox
+            val buf = 0.002
+            doubleArrayOf(box.latSouth - buf, box.latNorth + buf, box.lonWest - buf, box.lonEast + buf)
+        }
+    }
 
     private fun confirmOfflineDownload() {
         if (!isNetworkAvailable()) {
@@ -441,26 +456,31 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // นับจำนวน tiles ที่จะโหลด
-        val totalTiles = countTiles(CAMPUS_SOUTH, CAMPUS_NORTH, CAMPUS_WEST, CAMPUS_EAST, ZOOM_MIN, ZOOM_MAX)
-        val estimatedMB = totalTiles * 15 / 1024  // ประมาณ 15KB/tile
+        val bounds = downloadBounds()
+        val (south, north, west, east) = listOf(bounds[0], bounds[1], bounds[2], bounds[3])
+        val areaDesc = if (customWaypoints.size >= 2)
+            "พื้นที่ครอบ waypoints ของคุณ (${customWaypoints.size} จุด)"
+        else
+            "พื้นที่ที่กำลังดูอยู่บน map"
+
+        val totalTiles = countTiles(south, north, west, east, ZOOM_MIN, ZOOM_MAX)
+        val estimatedMB = totalTiles * 15 / 1024
 
         AlertDialog.Builder(this)
             .setTitle("ดาวน์โหลดแผนที่ offline")
             .setMessage(
-                "โหลดแผนที่ทั้ง campus มจพ. ปราจีนบุรี\n" +
-                "(ไม่ใช่แค่ที่กำลังดูอยู่ — โหลดทุก zoom level)\n\n" +
-                "Zoom: $ZOOM_MIN (ภาพรวม) → $ZOOM_MAX (ตึกรายละเอียด)\n" +
+                "พื้นที่: $areaDesc\n" +
+                "Zoom: $ZOOM_MIN (ภาพรวม) → $ZOOM_MAX (รายละเอียด)\n" +
                 "จำนวน tiles: ~$totalTiles (~${estimatedMB} MB)\n\n" +
-                "หลังโหลดเสร็จ ใช้ offline ได้โดยไม่ต้องต่อเน็ต"
+                "ใช้ได้ทุกที่บน map — ไม่จำกัดแค่ มจพ."
             )
-            .setPositiveButton("โหลดทั้ง campus") { _, _ -> startOfflineDownload() }
+            .setPositiveButton("ดาวน์โหลด") { _, _ -> startOfflineDownload(south, north, west, east) }
             .setNegativeButton("ยกเลิก", null)
             .show()
     }
 
-    private fun startOfflineDownload() {
-        val tiles = buildTileList(CAMPUS_SOUTH, CAMPUS_NORTH, CAMPUS_WEST, CAMPUS_EAST, ZOOM_MIN, ZOOM_MAX)
+    private fun startOfflineDownload(south: Double, north: Double, west: Double, east: Double) {
+        val tiles = buildTileList(south, north, west, east, ZOOM_MIN, ZOOM_MAX)
         val tileSource = mapView.tileProvider.tileSource as? OnlineTileSourceBase ?: run {
             Toast.makeText(this, "ไม่รองรับการดาวน์โหลด tile source นี้", Toast.LENGTH_SHORT).show()
             return
