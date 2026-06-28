@@ -28,9 +28,10 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapEventsReceiver
-import org.osmdroid.util.MapTileIndex
-import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
-import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.tileprovider.cachemanager.CacheManager
+import org.osmdroid.tileprovider.tilesource.TileSourcePolicy
+import org.osmdroid.tileprovider.tilesource.XYTileSource
+import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
@@ -86,6 +87,19 @@ class MainActivity : ComponentActivity() {
     // จุดตั้งต้นกล้อง — ประตูหลัก มจพ. ปราจีนบุรี
     private val KMUTNB_GATE = GeoPoint(14.16100, 101.34720)
 
+    // Tile source แบบกำหนดเอง — ชื่อ "Mapnik" (cache ใช้ร่วมกับ map) + policy อนุญาต bulk download
+    // (MAPNIK ปกติตั้ง FLAG_NO_BULK ทำให้ CacheManager โหลด offline ไม่ได้)
+    private val tileSource = XYTileSource(
+        "Mapnik", 0, 19, 256, ".png",
+        arrayOf(
+            "https://a.tile.openstreetmap.org/",
+            "https://b.tile.openstreetmap.org/",
+            "https://c.tile.openstreetmap.org/"
+        ),
+        "© OpenStreetMap contributors",
+        TileSourcePolicy(2, 0)   // maxConcurrent=2, flags=0 → acceptsBulkDownload = true
+    )
+
     private val PERMISSION_CODE = 1001
     private val ARRIVE_DISTANCE_M = 15f
 
@@ -132,7 +146,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setupMap() {
-        mapView.setTileSource(TileSourceFactory.MAPNIK)
+        mapView.setTileSource(tileSource)
         mapView.setMultiTouchControls(true)
         mapView.isTilesScaledToDpi = false      // tiles คม ไม่ blur บน high-DPI
         mapView.setUseDataConnection(true)       // โหลด tiles จากอินเทอร์เน็ตได้เสมอ
@@ -374,7 +388,7 @@ class MainActivity : ComponentActivity() {
         return (Math.toDegrees(atan2(y, x)) + 360.0) % 360.0
     }
 
-    // ระยะทางรวมที่เหลือ: ตำแหน่งปัจจุบัน → จุดถัดไป → .... → จุดสุดท้าย
+    // ระยะทางรวมที่เหลือ: ตำแหน่งปัจจุบัน → จุดถัดไป → .... → จุดสุดท้ายf
     private fun computeTotalRemaining(current: Location): Float {
         if (currentWaypointIndex >= customWaypoints.size) return 0f
         var total = current.distanceTo(Location("").also {
@@ -472,123 +486,75 @@ class MainActivity : ComponentActivity() {
                 "พื้นที่: $areaDesc\n" +
                 "Zoom: $ZOOM_MIN (ภาพรวม) → $ZOOM_MAX (รายละเอียด)\n" +
                 "จำนวน tiles: ~$totalTiles (~${estimatedMB} MB)\n\n" +
-                "ใช้ได้ทุกที่บน map — ไม่จำกัดแค่ มจพ."
+                "อย่าปิดแอประหว่างดาวน์โหลด\nใช้ได้ทุกที่บน map — ไม่จำกัดแค่ มจพ."
             )
-            .setPositiveButton("ดาวน์โหลด") { _, _ -> startOfflineDownload(south, north, west, east) }
+            .setPositiveButton("ดาวน์โหลด") { _, _ ->
+                startOfflineDownload(BoundingBox(north, east, south, west))
+            }
             .setNegativeButton("ยกเลิก", null)
             .show()
     }
 
-    private fun startOfflineDownload(south: Double, north: Double, west: Double, east: Double) {
-        val tiles = buildTileList(south, north, west, east, ZOOM_MIN, ZOOM_MAX)
-        val tileSource = mapView.tileProvider.tileSource as? OnlineTileSourceBase ?: run {
-            Toast.makeText(this, "ไม่รองรับการดาวน์โหลด tile source นี้", Toast.LENGTH_SHORT).show()
+    private fun startOfflineDownload(bbox: BoundingBox) {
+        val cacheManager = try {
+            CacheManager(mapView)
+        } catch (e: Exception) {
+            Toast.makeText(this, "tile source ไม่รองรับการดาวน์โหลด: ${e.message}", Toast.LENGTH_LONG).show()
             return
         }
-        val tileWriter = mapView.tileProvider.tileWriter
 
-        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = tiles.size
-        }
-        val zoomText = TextView(this).apply {
-            setPadding(0, 16, 0, 0)
-            textSize = 13f
-            text = "กำลังเริ่ม..."
-        }
-        val countText = TextView(this).apply {
-            setPadding(0, 4, 0, 0)
-            textSize = 11f
+        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
+        val statusText = TextView(this).apply {
+            setPadding(0, 16, 0, 0); textSize = 13f; text = "กำลังเตรียมดาวน์โหลด..."
         }
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(60, 40, 60, 20)
-            addView(progressBar)
-            addView(zoomText)
-            addView(countText)
+            addView(progressBar); addView(statusText)
         }
-
         val dialog = AlertDialog.Builder(this)
-            .setTitle("กำลังดาวน์โหลดแผนที่ทั้ง campus...")
+            .setTitle("กำลังดาวน์โหลดแผนที่...")
             .setView(layout)
             .setCancelable(false)
             .create()
         dialog.show()
         downloadMapButton.isEnabled = false
 
-        Thread {
-            var downloaded = 0
-            var skipped = 0
-            var failed = 0
-
-            tiles.forEachIndexed { i, tileIndex ->
-                val zoom = MapTileIndex.getZoom(tileIndex)
-                try {
-                    if (tileWriter != null && tileWriter.exists(tileSource, tileIndex)) {
-                        skipped++
-                    } else {
-                        val url = tileSource.getTileURLString(tileIndex)
-                        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-                        conn.setRequestProperty("User-Agent", packageName)
-                        conn.connectTimeout = 10_000
-                        conn.readTimeout = 10_000
-                        conn.connect()
-                        if (conn.responseCode == 200) {
-                            tileWriter?.saveFile(tileSource, tileIndex, conn.inputStream, null)
-                            downloaded++
-                        } else {
-                            failed++
-                        }
-                        conn.disconnect()
-                        Thread.sleep(80) // polite rate limit — OSM policy
-                    }
-                } catch (_: Exception) {
-                    failed++
+        cacheManager.downloadAreaAsync(this, bbox, ZOOM_MIN, ZOOM_MAX,
+            object : CacheManager.CacheManagerCallback {
+                override fun setPossibleTilesInArea(total: Int) {
+                    progressBar.max = if (total > 0) total else 100
                 }
-
-                if (i % 10 == 0 || i == tiles.size - 1) {
-                    val pct = (i + 1) * 100 / tiles.size
-                    runOnUiThread {
-                        progressBar.progress = i + 1
-                        zoomText.text = "zoom $zoom  |  $pct%  (${i + 1}/${tiles.size})"
-                        countText.text = "ดาวน์โหลด: $downloaded  |  มีแล้ว: $skipped  |  ผิดพลาด: $failed"
-                    }
+                override fun downloadStarted() {
+                    statusText.text = "เริ่มดาวน์โหลด..."
                 }
-            }
-
-            runOnUiThread {
-                dialog.dismiss()
-                downloadMapButton.isEnabled = true
-                AlertDialog.Builder(this)
-                    .setTitle("ดาวน์โหลดเสร็จแล้ว!")
-                    .setMessage(
-                        "ดาวน์โหลดใหม่: $downloaded tiles\n" +
-                        "มีอยู่แล้ว (ข้าม): $skipped tiles\n" +
-                        "ผิดพลาด: $failed tiles\n\n" +
-                        "แผนที่ทั้ง campus มจพ. ปราจีนบุรี\nพร้อมใช้ offline ได้แล้ว!"
-                    )
-                    .setPositiveButton("ตกลง", null)
-                    .show()
-            }
-        }.start()
-    }
-
-    private fun buildTileList(
-        south: Double, north: Double, west: Double, east: Double,
-        zoomMin: Int, zoomMax: Int
-    ): List<Long> {
-        val list = mutableListOf<Long>()
-        for (zoom in zoomMin..zoomMax) {
-            val minX = lon2tile(west, zoom)
-            val maxX = lon2tile(east, zoom)
-            val minY = lat2tile(north, zoom) // north = smaller Y in tile coords
-            val maxY = lat2tile(south, zoom)
-            for (x in minX..maxX) {
-                for (y in minY..maxY) {
-                    list.add(MapTileIndex.getTileIndex(zoom, x, y))
+                override fun updateProgress(progress: Int, currentZoom: Int, zoomMin: Int, zoomMax: Int) {
+                    progressBar.progress = progress
+                    val pct = if (progressBar.max > 0) progress * 100 / progressBar.max else 0
+                    statusText.text = "$pct%  ($progress/${progressBar.max} tiles)  |  zoom $currentZoom"
                 }
-            }
-        }
-        return list
+                override fun onTaskComplete() {
+                    dialog.dismiss()
+                    downloadMapButton.isEnabled = true
+                    mapView.invalidate()
+                    val usedMB = cacheManager.currentCacheUsage() / (1024.0 * 1024.0)
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("ดาวน์โหลดเสร็จแล้ว!")
+                        .setMessage(
+                            "แผนที่พร้อมใช้ offline แล้ว\n\n" +
+                            "ขนาด cache ทั้งหมด: ${"%.1f".format(usedMB)} MB\n\n" +
+                            "ลองปิดเน็ตแล้วเลื่อนดูพื้นที่นี้ได้เลย"
+                        )
+                        .setPositiveButton("ตกลง", null)
+                        .show()
+                }
+                override fun onTaskFailed(errors: Int) {
+                    dialog.dismiss()
+                    downloadMapButton.isEnabled = true
+                    Toast.makeText(this@MainActivity,
+                        "ดาวน์โหลดผิดพลาด $errors tiles (ลองใหม่อีกครั้ง)", Toast.LENGTH_LONG).show()
+                }
+            })
     }
 
     private fun countTiles(
@@ -627,6 +593,10 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         mapView.onResume()
+        // ไม่มีเน็ต → อ่านจาก cache อย่างเดียว (ไม่เสียเวลา timeout รอโหลด tile ที่โหลดไม่ได้)
+        // มีเน็ต → โหลด tile ที่ขาดเพิ่มได้
+        mapView.setUseDataConnection(isNetworkAvailable())
+        mapView.invalidate()
         if (hasGpsPermission()) startLocationUpdates()
     }
 
