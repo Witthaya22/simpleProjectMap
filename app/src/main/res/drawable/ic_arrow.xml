@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <!-- ลูกศรชี้ขึ้น (ทิศเหนือ = ตรงหน้า) -->
+    <path
+        android:fillColor="#FF5722"
+        android:pathData="M24,4 L40,42 L24,34 L8,42 Z" />
+    <!-- จุดกึ่งกลางสีขาว -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M24,20 m-3,0 a3,3 0,1 1,6,0 a3,3 0,1 1,-6,0" />
+</vector>

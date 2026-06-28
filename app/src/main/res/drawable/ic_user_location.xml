@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="32dp"
+    android:height="32dp"
+    android:viewportWidth="32"
+    android:viewportHeight="32">
+    <!-- วงกลมด้านนอกสีน้ำเงินเข้ม (เงา) -->
+    <path
+        android:fillColor="#1A1565C0"
+        android:pathData="M16,2 A14,14 0,1 1,16,30 A14,14 0,1 1,16,2 Z" />
+    <!-- วงกลมหลักสีน้ำเงิน -->
+    <path
+        android:fillColor="#1976D2"
+        android:pathData="M16,5 A11,11 0,1 1,16,27 A11,11 0,1 1,16,5 Z" />
+    <!-- จุดขาวตรงกลาง -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M16,11 A5,5 0,1 1,16,21 A5,5 0,1 1,16,11 Z" />
+</vector>
