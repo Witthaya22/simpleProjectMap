@@ -36,6 +36,7 @@ import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polygon
 import org.osmdroid.views.overlay.Polyline
 import java.io.File
 import kotlin.math.atan2
@@ -78,6 +79,7 @@ class MainActivity : ComponentActivity() {
     private var isNavigating = false
     private var currentWaypointIndex = 0
     private var userMarker: Marker? = null
+    private var accuracyCircle: Polygon? = null
     private var routePolyline: Polyline? = null
 
     // ── Waypoints ที่ผู้ใช้แตะเลือก ──
@@ -101,7 +103,8 @@ class MainActivity : ComponentActivity() {
     )
 
     private val PERMISSION_CODE = 1001
-    private val ARRIVE_DISTANCE_M = 15f
+    // GPS ใต้ร่มไม้/ต้นไม้คลาดเคลื่อนได้ 10-30 ม. (พบใน progress report เขาใหญ่) — ขยายจาก 15 เป็น 25 ม.
+    private val ARRIVE_DISTANCE_M = 25f
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -318,6 +321,7 @@ class MainActivity : ComponentActivity() {
         val userPoint = GeoPoint(location.latitude, location.longitude)
         lastUserLocation = userPoint
         refreshUserMarker(userPoint)
+        refreshAccuracyCircle(userPoint, location.accuracy)
 
         if (!isNavigating || currentWaypointIndex >= customWaypoints.size) return
 
@@ -336,9 +340,9 @@ class MainActivity : ComponentActivity() {
         )
         arrowView.rotation = bearing.toFloat()
 
-        // ระยะทางรวมที่เหลือ
+        // ระยะทางรวมที่เหลือ — แสดง accuracy ปัจจุบันด้วย เพื่อดูตอนทดสอบว่า GPS แม่นแค่ไหน
         val remaining = computeTotalRemaining(location)
-        distanceText.text = "ระยะทางที่เหลือ: ${remaining.toInt()} เมตร"
+        distanceText.text = "ระยะทางที่เหลือ: ${remaining.toInt()} เมตร  (GPS ±${location.accuracy.toInt()} ม.)"
 
         mapView.controller.animateTo(userPoint)
 
@@ -374,6 +378,20 @@ class MainActivity : ComponentActivity() {
         insertBeforeEventsOverlay(marker)
         userMarker = marker
         mapView.invalidate()
+    }
+
+    // วงกลมแสดงความคลาดเคลื่อนของ GPS รอบตำแหน่งผู้ใช้ — ช่วยดูตอนทดสอบว่า accuracy แย่แค่ไหน (เช่น ใต้ร่มไม้)
+    private fun refreshAccuracyCircle(point: GeoPoint, accuracyMeters: Float) {
+        accuracyCircle?.let { mapView.overlays.remove(it) }
+        val circle = Polygon(mapView).apply {
+            points = Polygon.pointsAsCircle(point, accuracyMeters.toDouble())
+            fillPaint.color = 0x220000FF
+            outlinePaint.color = 0x550000FF.toInt()
+            outlinePaint.strokeWidth = 2f
+            isEnabled = false
+        }
+        insertBeforeEventsOverlay(circle)
+        accuracyCircle = circle
     }
 
     // ───────────────────────── Calculations ─────────────────────────
