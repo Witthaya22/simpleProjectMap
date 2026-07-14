@@ -90,6 +90,16 @@
 
         </LinearLayout>
 
+        <!-- ปุ่มปรับเทียบ GPS (แก้อาการจุดยืนเยื้อง) — กดค้างเพื่อล้างค่า -->
+        <Button
+            android:id="@+id/calibrateButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:text="🎯 ปรับเทียบ"
+            android:textAllCaps="false"
+            android:textSize="14sp" />
+
         <!-- ปุ่มเริ่มนำทาง + ดาวน์โหลดแผนที่ -->
         <LinearLayout
             android:layout_width="match_parent"

@@ -59,6 +59,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var clearButton: Button
     private lateinit var startNavButton: Button
     private lateinit var downloadMapButton: Button
+    private lateinit var calibrateButton: Button
 
     // ── Nav Mode Views ──
     private lateinit var navPanel: LinearLayout
@@ -86,8 +87,15 @@ class MainActivity : ComponentActivity() {
     private val customWaypoints = mutableListOf<GeoPoint>()
     private val waypointMarkers = mutableListOf<Marker>()
 
-    // จุดตั้งต้นกล้อง — ประตูหลัก มจพ. ปราจีนบุรี
-    private val KMUTNB_GATE = GeoPoint(14.16100, 101.34720)
+    // จุดตั้งต้นกล้อง — ศูนย์บริการนักท่องเที่ยว อุทยานแห่งชาติเขาใหญ่
+    private val KHAOYAI_CENTER = GeoPoint(14.43960, 101.37230)
+
+    // ── GPS calibration (แก้อาการ "เยื้องคงที่ทิศเดิม" = bias) ──
+    // offset เป็นองศา บวกเข้ากับทุก fix ดิบ เพื่อหักล้าง bias คงที่ของชิป/multipath
+    private var calibOffsetLat = 0.0
+    private var calibOffsetLng = 0.0
+    private var lastRawLocation: Location? = null   // fix ดิบล่าสุด (ก่อนหัก offset) — ใช้ตอนปรับเทียบ
+    private var isCalibrating = false               // true = แตะแผนที่ครั้งถัดไปคือ "ตำแหน่งจริง"
 
     // Tile source แบบกำหนดเอง — ชื่อ "Mapnik" (cache ใช้ร่วมกับ map) + policy อนุญาต bulk download
     // (MAPNIK ปกติตั้ง FLAG_NO_BULK ทำให้ CacheManager โหลด offline ไม่ได้)
@@ -122,6 +130,7 @@ class MainActivity : ComponentActivity() {
 
         setContentView(R.layout.activity_main)
         bindViews()
+        loadCalibration()
         setupMap()
         setupGps()
         setupButtons()
@@ -140,6 +149,7 @@ class MainActivity : ComponentActivity() {
         clearButton = findViewById(R.id.clearButton)
         startNavButton = findViewById(R.id.startNavButton)
         downloadMapButton = findViewById(R.id.downloadMapButton)
+        calibrateButton = findViewById(R.id.calibrateButton)
         navPanel = findViewById(R.id.navPanel)
         targetLabel = findViewById(R.id.targetLabel)
         arrowView = findViewById(R.id.arrowView)
@@ -153,14 +163,17 @@ class MainActivity : ComponentActivity() {
         mapView.setMultiTouchControls(true)
         mapView.isTilesScaledToDpi = false      // tiles คม ไม่ blur บน high-DPI
         mapView.setUseDataConnection(true)       // โหลด tiles จากอินเทอร์เน็ตได้เสมอ
-        mapView.controller.setZoom(17.0)         // zoom 17 = มองเห็นพื้นที่ดีกว่า ก่อนซูมเข้าเอง
-        mapView.controller.setCenter(KMUTNB_GATE)
+        mapView.controller.setZoom(15.0)         // zoom 15 = เห็นภาพรวมอุทยานเขาใหญ่ ก่อนซูมเข้าเอง
+        mapView.controller.setCenter(KHAOYAI_CENTER)
 
         // MapEventsOverlay รับ tap บนแผนที่ — ต้องอยู่ท้ายสุดเสมอ
         // เพื่อให้ Markers ที่อยู่ก่อนหน้ามันรับ tap ก่อน (ถ้า tap ตรง marker → info window, ไม่เพิ่มจุด)
         mapEventsOverlay = MapEventsOverlay(object : MapEventsReceiver {
             override fun singleTapConfirmedHelper(p: GeoPoint): Boolean {
-                if (!isNavigating) { addWaypoint(p); return true }
+                when {
+                    isCalibrating -> { handleCalibrationTap(p); return true }
+                    !isNavigating -> { addWaypoint(p); return true }
+                }
                 return false
             }
             override fun longPressHelper(p: GeoPoint): Boolean = false
@@ -199,6 +212,11 @@ class MainActivity : ComponentActivity() {
 
         stopButton.setOnClickListener { stopNavigation() }
         downloadMapButton.setOnClickListener { confirmOfflineDownload() }
+
+        // แตะ = เริ่มปรับเทียบ (แตะจุดจริงบนแผนที่ต่อ) | กดค้าง = ล้างค่าปรับเทียบ
+        calibrateButton.setOnClickListener { startCalibration() }
+        calibrateButton.setOnLongClickListener { resetCalibration(); true }
+        updateCalibrateButtonLabel()
         locateMeButton.setOnClickListener {
             val loc = lastUserLocation
             if (loc != null) mapView.controller.animateTo(loc)
@@ -317,7 +335,10 @@ class MainActivity : ComponentActivity() {
         mapView.invalidate()
     }
 
-    private fun processLocation(location: Location) {
+    private fun processLocation(raw: Location) {
+        lastRawLocation = raw
+        // หัก bias คงที่ออกก่อนใช้งานทุกอย่าง (นำทาง/วาดจุด/ระยะทาง)
+        val location = applyCalibration(raw)
         val userPoint = GeoPoint(location.latitude, location.longitude)
         lastUserLocation = userPoint
         refreshUserMarker(userPoint)
@@ -392,6 +413,93 @@ class MainActivity : ComponentActivity() {
         }
         insertBeforeEventsOverlay(circle)
         accuracyCircle = circle
+    }
+
+    // ───────────────────────── GPS Calibration ─────────────────────────
+
+    // บวก offset เข้ากับ fix ดิบ (คืน object ใหม่ ไม่แก้ของเดิม)
+    private fun applyCalibration(loc: Location): Location {
+        if (calibOffsetLat == 0.0 && calibOffsetLng == 0.0) return loc
+        return Location(loc).apply {
+            latitude = loc.latitude + calibOffsetLat
+            longitude = loc.longitude + calibOffsetLng
+        }
+    }
+
+    // แตะปุ่ม "ปรับเทียบ" → เข้าโหมดรอผู้ใช้แตะตำแหน่งจริงบนแผนที่
+    private fun startCalibration() {
+        if (lastRawLocation == null) {
+            Toast.makeText(this, "ยังไม่ได้รับสัญญาณ GPS — รอสักครู่แล้วลองใหม่", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (isNavigating) {
+            Toast.makeText(this, "หยุดนำทางก่อนจึงจะปรับเทียบได้", Toast.LENGTH_SHORT).show()
+            return
+        }
+        isCalibrating = true
+        tapHintBanner.text = "🎯 ยืนนิ่งๆ แล้วแตะบนแผนที่ตรงตำแหน่ง 'จริง' ที่คุณอยู่"
+        Toast.makeText(this, "แตะบนแผนที่ตรงจุดที่คุณยืนอยู่จริง", Toast.LENGTH_LONG).show()
+    }
+
+    // ผู้ใช้แตะจุดจริง → offset = จุดจริง − fix ดิบ
+    private fun handleCalibrationTap(actualPoint: GeoPoint) {
+        val raw = lastRawLocation
+        if (raw == null) {
+            Toast.makeText(this, "ยังไม่ได้รับสัญญาณ GPS", Toast.LENGTH_SHORT).show()
+            isCalibrating = false
+            resetHintBanner()
+            return
+        }
+        calibOffsetLat = actualPoint.latitude - raw.latitude
+        calibOffsetLng = actualPoint.longitude - raw.longitude
+        isCalibrating = false
+        saveCalibration()
+        resetHintBanner()
+
+        val shiftM = raw.distanceTo(Location("actual").also {
+            it.latitude = actualPoint.latitude
+            it.longitude = actualPoint.longitude
+        })
+        Toast.makeText(this, "ปรับเทียบแล้ว: หักตำแหน่ง ${shiftM.toInt()} ม.", Toast.LENGTH_LONG).show()
+        updateCalibrateButtonLabel()
+        processLocation(raw)   // วาดจุดใหม่ทันทีด้วย offset ที่เพิ่งตั้ง
+    }
+
+    private fun resetCalibration() {
+        if (calibOffsetLat == 0.0 && calibOffsetLng == 0.0) {
+            Toast.makeText(this, "ยังไม่มีค่าปรับเทียบ", Toast.LENGTH_SHORT).show()
+            return
+        }
+        calibOffsetLat = 0.0
+        calibOffsetLng = 0.0
+        saveCalibration()
+        updateCalibrateButtonLabel()
+        Toast.makeText(this, "ล้างค่าปรับเทียบแล้ว", Toast.LENGTH_SHORT).show()
+        lastRawLocation?.let { processLocation(it) }
+    }
+
+    private fun resetHintBanner() {
+        tapHintBanner.text = "แตะบนแผนที่เพื่อเพิ่มจุดเดิน"
+    }
+
+    // ปุ่มแสดงสถานะ: มีค่าปรับเทียบอยู่หรือไม่
+    private fun updateCalibrateButtonLabel() {
+        val on = calibOffsetLat != 0.0 || calibOffsetLng != 0.0
+        calibrateButton.text = if (on) "🎯 ปรับเทียบ ✓" else "🎯 ปรับเทียบ"
+    }
+
+    private fun saveCalibration() {
+        // เก็บเป็น bits ของ Double เพื่อคงความละเอียด (SharedPreferences ไม่มี putDouble)
+        getSharedPreferences("nav", MODE_PRIVATE).edit()
+            .putLong("calibLatBits", java.lang.Double.doubleToRawLongBits(calibOffsetLat))
+            .putLong("calibLngBits", java.lang.Double.doubleToRawLongBits(calibOffsetLng))
+            .apply()
+    }
+
+    private fun loadCalibration() {
+        val p = getSharedPreferences("nav", MODE_PRIVATE)
+        calibOffsetLat = java.lang.Double.longBitsToDouble(p.getLong("calibLatBits", 0L))
+        calibOffsetLng = java.lang.Double.longBitsToDouble(p.getLong("calibLngBits", 0L))
     }
 
     // ───────────────────────── Calculations ─────────────────────────
@@ -504,7 +612,7 @@ class MainActivity : ComponentActivity() {
                 "พื้นที่: $areaDesc\n" +
                 "Zoom: $ZOOM_MIN (ภาพรวม) → $ZOOM_MAX (รายละเอียด)\n" +
                 "จำนวน tiles: ~$totalTiles (~${estimatedMB} MB)\n\n" +
-                "อย่าปิดแอประหว่างดาวน์โหลด\nใช้ได้ทุกที่บน map — ไม่จำกัดแค่ มจพ."
+                "อย่าปิดแอประหว่างดาวน์โหลด\nใช้ได้ทุกที่บน map — เลื่อนไปโซนเขาใหญ่ที่ต้องการก่อนโหลด"
             )
             .setPositiveButton("ดาวน์โหลด") { _, _ ->
                 startOfflineDownload(BoundingBox(north, east, south, west))
